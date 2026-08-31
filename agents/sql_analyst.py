@@ -122,19 +122,45 @@ def execute_sql(state: AgentSchema) -> AgentSchema:
     sql_query = state.generated_sql_query
 
     conn_details = {
-        "host": os.environ['host'],
-        "port": os.environ['port'],
-        "user": os.environ['user'],
-        "password": os.environ['password'],
-        "dbname": os.environ['database']
+        "host": os.environ.get('host', 'localhost'),
+        "port": os.environ.get('port', 5432),
+        "user": os.environ.get('user', 'postgres'),
+        "password": os.environ.get('password', 'postgres'),
+        "dbname": os.environ.get('database', 'postgres')
     }
 
     obj = DatabaseUtil(conn_details)
 
     execution_result = obj.execute_sql(sql_query)  # Execute the SQL query on the database
 
-    state.sql_query_execution_result = execution_result
+    if execution_result is None or (isinstance(execution_result, str) and execution_result.startswith("Error")):
+        state.sql_error_message = str(execution_result)
+        state.sql_query_execution_result = ""
+    else:
+        state.sql_error_message = ""
+        state.sql_query_execution_result = execution_result
 
+    return state
+
+
+# SQL Error Self-Correction Reflection Node
+def sql_error_reflection_node(state: AgentSchema) -> AgentSchema:
+    state.sql_retry_count += 1
+    error_msg = state.sql_error_message
+    failed_sql = state.generated_sql_query
+    
+    # Construct an updated prompt context informing LLM of the database error
+    corrective_prompt = f"""{state.prompt_query_context}
+
+    CRITICAL REFLECTION (Attempt {state.sql_retry_count} of 3):
+    Your previous SQL query failed during execution on PostgreSQL.
+    Failed SQL Query: {failed_sql}
+    PostgreSQL Execution Error: {error_msg}
+    
+    Please analyze the database schema details above and generate a CORRECTED, valid PostgreSQL SQL query.
+    Return ONLY the corrected SQL query without any explanation.
+    """
+    state.prompt_query_context = corrective_prompt
     return state
 
 
@@ -169,13 +195,14 @@ def represent_final_answer(state: AgentSchema) -> AgentSchema:
 sql_agent_graph = StateGraph(AgentSchema)
 
 # Nodes
-sql_agent_graph.add_node(curate_ques,name="curate_ques")
-sql_agent_graph.add_node(prompt_query_context,name="prompt_query_context")
-sql_agent_graph.add_node(generate_sql,name="generate_sql")
-sql_agent_graph.add_node(is_safe_sql,name="is_safe_sql")
-sql_agent_graph.add_node(canceled_sql,name="canceled_sql")
-sql_agent_graph.add_node(execute_sql,name="execute_sql")
-sql_agent_graph.add_node(represent_final_answer,name="represent_final_answer")
+sql_agent_graph.add_node(curate_ques, name="curate_ques")
+sql_agent_graph.add_node(prompt_query_context, name="prompt_query_context")
+sql_agent_graph.add_node(generate_sql, name="generate_sql")
+sql_agent_graph.add_node(is_safe_sql, name="is_safe_sql")
+sql_agent_graph.add_node(canceled_sql, name="canceled_sql")
+sql_agent_graph.add_node(execute_sql, name="execute_sql")
+sql_agent_graph.add_node(sql_error_reflection_node, name="sql_error_reflection_node")
+sql_agent_graph.add_node(represent_final_answer, name="represent_final_answer")
 
 # Edges
 sql_agent_graph.add_edge(START, "curate_ques")
@@ -183,14 +210,12 @@ sql_agent_graph.add_edge("curate_ques", "prompt_query_context")
 sql_agent_graph.add_edge("prompt_query_context", "generate_sql")
 sql_agent_graph.add_edge("generate_sql", "is_safe_sql")
 
-# Codintional Edge Function
+# Conditional Safety Edge Function
 def is_safe_sql_edge(state: AgentSchema) -> str:
     is_safe = state.is_safe
-
     if is_safe.lower() == "yes":
         return "execute_sql"
-
-    else :
+    else:
         return "canceled_sql"
 
 sql_agent_graph.add_conditional_edges("is_safe_sql", is_safe_sql_edge,
@@ -199,15 +224,26 @@ sql_agent_graph.add_conditional_edges("is_safe_sql", is_safe_sql_edge,
                                           "canceled_sql": "canceled_sql"
                                       })
 
-# sql_agent_graph.add_edge("is_safe_sql", "execute_sql")
-# sql_agent_graph.add_edge("is_safe_sql", "canceled_sql")
+# Conditional Retry Edge Function after Execution
+def check_sql_execution_edge(state: AgentSchema) -> str:
+    if state.sql_error_message and state.sql_retry_count < 3:
+        return "sql_error_reflection_node"
+    else:
+        return "represent_final_answer"
 
+sql_agent_graph.add_conditional_edges("execute_sql", check_sql_execution_edge,
+                                      {
+                                          "sql_error_reflection_node": "sql_error_reflection_node",
+                                          "represent_final_answer": "represent_final_answer"
+                                      })
+
+sql_agent_graph.add_edge("sql_error_reflection_node", "generate_sql")
 sql_agent_graph.add_edge("canceled_sql", END)
-sql_agent_graph.add_edge("execute_sql", "represent_final_answer")
 sql_agent_graph.add_edge("represent_final_answer", END)
 
 # Compile the Graph
 sql_analyst = sql_agent_graph.compile()
+
 
 if __name__ == "__main__":
 
